@@ -5,8 +5,6 @@
  */
 
 #include <algorithm>
-#include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +38,7 @@
 
 constexpr static std::string_view DEFAULT_OUTPUT = "system.img";
 constexpr static int BLOCK_SIZE = 4096;
+constexpr static size_t IO_BUFFER_SIZE = 4 * 1024 * 1024;
 using FileSizeT = std::fstream::off_type;
 
 // Define likely/unlikely based on the compiler used
@@ -68,15 +67,31 @@ struct TransferList {
     ByteSegments(FileSizeT begin, FileSizeT end) : _begin(begin), _end(end) {}
 
     void writeToFile(std::istream &in, std::ostream &out) const {
-      FileSizeT block_count = _end - _begin;
+      const FileSizeT block_count = _end - _begin;
+      FileSizeT bytes_remaining = block_count * BLOCK_SIZE;
+      static thread_local std::vector<char> buffer(IO_BUFFER_SIZE);
+
       std::cout << "Copying " << block_count << " blocks into position "
                 << _begin << "..." << std::endl;
       out.seekp(_begin * BLOCK_SIZE, std::ios::beg);
-      while (block_count > 0) {
-        std::array<char, BLOCK_SIZE> buffer{};
-        in.read(buffer.data(), BLOCK_SIZE);
-        out.write(buffer.data(), BLOCK_SIZE);
-        block_count--;
+      if (unlikely(!out)) {
+        throw std::runtime_error("Failed to seek output image");
+      }
+
+      while (bytes_remaining > 0) {
+        const auto chunk_size = static_cast<std::streamsize>(std::min<FileSizeT>(
+            bytes_remaining, static_cast<FileSizeT>(buffer.size())));
+
+        in.read(buffer.data(), chunk_size);
+        if (unlikely(in.gcount() != chunk_size)) {
+          throw std::runtime_error("Unexpected end of input data");
+        }
+
+        out.write(buffer.data(), chunk_size);
+        if (unlikely(!out)) {
+          throw std::runtime_error("Failed to write output image");
+        }
+        bytes_remaining -= chunk_size;
       }
     }
 
@@ -382,11 +397,10 @@ public:
     }
 
     // Decompression buffer
-    const size_t kBufferSize = 4096;
-    std::vector<uint8_t> output_buffer(kBufferSize);
+    std::vector<uint8_t> output_buffer(IO_BUFFER_SIZE);
 
     size_t input_pos = 0;
-    size_t available_out = kBufferSize;
+    size_t available_out = output_buffer.size();
     uint8_t *output_ptr = output_buffer.data();
 
     // Decompress the data
@@ -402,8 +416,15 @@ public:
       // Write the decompressed data to the output file
       if (output_ptr != output_buffer.data()) {
         output.write(reinterpret_cast<char *>(output_buffer.data()),
-                     kBufferSize - available_out);
-        available_out = kBufferSize;
+                     static_cast<std::streamsize>(output_buffer.size() -
+                                                  available_out));
+        if (unlikely(!output)) {
+          std::cerr << "Error writing decompressed output: " << output_file
+                    << std::endl;
+          BrotliDecoderDestroyInstance(state);
+          return false;
+        }
+        available_out = output_buffer.size();
         output_ptr = output_buffer.data();
       }
 
@@ -432,7 +453,6 @@ private:
 
 int main(int argc, const char *argv[]) {
   std::filesystem::path transfer_list_file, new_dat_file, output_img;
-  int block_count = 0;
   std::error_code ec;
 
   if (argc != 4 && argc != 3) {
@@ -471,15 +491,19 @@ int main(int argc, const char *argv[]) {
     usage(argv[0]);
   }
 
-  typedef const int cint;
 #ifdef HAS_FADVISE
-  cint fd = open(new_dat_file.c_str(), O_RDONLY);
+  const int fd = open(new_dat_file.c_str(), O_RDONLY);
   if (fd != -1) {
-    cint rc =
-        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED);
-    if (rc != 0) {
-      std::cerr << "Warning: Failed to set file advise: " << strerror(errno)
-                << std::endl;
+    const int sequential_rc = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    if (sequential_rc != 0) {
+      std::cerr << "Warning: Failed to set sequential file advise: "
+                << strerror(sequential_rc) << std::endl;
+    }
+
+    const int willneed_rc = posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+    if (willneed_rc != 0) {
+      std::cerr << "Warning: Failed to set readahead file advise: "
+                << strerror(willneed_rc) << std::endl;
     }
     close(fd);
   }
@@ -545,17 +569,22 @@ int main(int argc, const char *argv[]) {
   FileSizeT max_file_size = tlist.max() * BLOCK_SIZE;
   std::cout << "New file size: " << max_file_size << " bytes" << std::endl;
 
-  tlist.forEachCommand([&](const TransferList::Command c,
-                           const TransferList::ByteSegments &seg) {
-    switch (c) {
-    case TransferList::Command::New: {
-      seg.writeToFile(input_dat, output);
-      break;
-    }
-    default:
-      std::cout << "Skipping command " << c << "..." << std::endl;
-    }
-  });
+  try {
+    tlist.forEachCommand([&](const TransferList::Command c,
+                             const TransferList::ByteSegments &seg) {
+      switch (c) {
+      case TransferList::Command::New: {
+        seg.writeToFile(input_dat, output);
+        break;
+      }
+      default:
+        std::cout << "Skipping command " << c << "..." << std::endl;
+      }
+    });
+  } catch (const std::exception &e) {
+    std::cerr << "Error: " << e.what() << std::endl;
+    return EXIT_FAILURE;
+  }
 
   output.close();
   input_dat.close();
